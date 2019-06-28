@@ -89,7 +89,7 @@ public final class JobState {
         ConcurrentHashMap<String, Master.Job> tmp_pendingJobKubernetes = new ConcurrentHashMap<>(jobState.pendingJobsKubernetes);
         Map<String, Master.Job> tmp_workInProgress = new HashMap<>(jobState.jobsInProgress);
 
-        Master.Job job1 = tmp_pendingJob.removeFirst();
+        tmp_pendingJob.removeFirst();
         Master.Job job = tmp_pendingJobKubernetes.get(workStarted.workId);
         tmp_pendingJobKubernetes.remove(workStarted.workId);
 
