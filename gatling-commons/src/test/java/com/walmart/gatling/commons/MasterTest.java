@@ -81,7 +81,7 @@ public class MasterTest  {
         log.setPort(8080);
         agentConfig.setLogServer(log);
         system = startMaster();
-        final Props props = Master.props(new FiniteDuration(20, TimeUnit.SECONDS), agentConfig);
+        final Props props = Master.props(new FiniteDuration(20, TimeUnit.SECONDS), agentConfig, false);
         master = system.actorOf(props, "master");
     }
 

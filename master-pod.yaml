@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: default
+  name: gatling-master
+  labels:
+    app: gatling
+    component: master
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gatling
+      component: master
+  template:
+    metadata:
+      name: gatling-master
+      labels:
+        app: gatling
+        component: master
+    spec:
+      containers:
+      - name: master
+        image: master:v1
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+        - containerPort: 2551

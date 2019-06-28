@@ -1,7 +1,7 @@
 /*
  *
  *   Copyright 2016 Walmart Technology
- *  
+ *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
  *   You may obtain a copy of the License at
@@ -18,6 +18,8 @@
 
 package com.walmart.gatling.commons;
 
+import com.sun.corba.se.spi.orbutil.threadpool.Work;
+
 import akka.actor.ActorRef;
 import akka.actor.Cancellable;
 import akka.actor.Props;
@@ -25,11 +27,16 @@ import akka.cluster.Cluster;
 import akka.cluster.client.ClusterClientReceptionist;
 import akka.event.Logging;
 import akka.event.LoggingAdapter;
+import akka.pattern.AskTimeoutException;
 import akka.persistence.AbstractPersistentActor;
 import akka.persistence.Recovery;
+import jersey.repackaged.com.google.common.cache.CacheBuilder;
+import jersey.repackaged.com.google.common.cache.CacheLoader;
+import jersey.repackaged.com.google.common.cache.LoadingCache;
 import jersey.repackaged.com.google.common.collect.ImmutableList;
 import jersey.repackaged.com.google.common.collect.ImmutableMap;
 import org.apache.commons.io.FileUtils;
+
 import scala.collection.JavaConversions;
 import scala.concurrent.duration.Deadline;
 import scala.concurrent.duration.FiniteDuration;
@@ -37,6 +44,7 @@ import scala.concurrent.duration.FiniteDuration;
 import java.io.File;
 import java.io.IOException;
 import java.io.Serializable;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -47,6 +55,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class Master extends AbstractPersistentActor {
@@ -68,16 +80,38 @@ public class Master extends AbstractPersistentActor {
     private Map<String, UploadFile> fileDatabase = new HashMap<>();
     private Set<String> cancelRequests = new HashSet<>();
 
-    public Master(FiniteDuration workTimeout, AgentConfig agentConfig) {
+
+    private LoadingCache<String, List<WorkerState>> workersPerTrakingIdCache = CacheBuilder.newBuilder()
+        .build(new CacheLoader<String, List<WorkerState>>() {
+            @Override
+            public List<WorkerState> load(final String s) throws Exception {
+                return null;
+            }
+        });
+
+    private LoadingCache<String, ReportExecutor.ReportResult> reportPerTrackingIdCache = CacheBuilder.newBuilder()
+        .build(new CacheLoader<String, ReportExecutor.ReportResult>() {
+            @Override
+            public ReportExecutor.ReportResult load(final String s) throws Exception {
+                return null;
+            }
+        });
+
+
+    private Map<String, List<String>> jobsPerTrackingID = new ConcurrentHashMap<>();
+    private final boolean isRunningOnKubernetes;
+
+    public Master(FiniteDuration workTimeout, AgentConfig agentConfig, boolean isRunningOnKubernetes) {
         this.workTimeout = workTimeout;
         this.agentConfig = agentConfig;
         this.reportExecutor = getContext().watch(getContext().actorOf(Props.create(ReportExecutor.class, agentConfig), "report"));
         ClusterClientReceptionist.get(getContext().system()).registerService(getSelf());
         this.cleanupTask = getContext().system().scheduler().schedule(workTimeout.div(2), workTimeout.div(2), getSelf(), CleanupTick, getContext().dispatcher(), getSelf());
+        this.isRunningOnKubernetes = isRunningOnKubernetes;
     }
 
-    public static Props props(FiniteDuration workTimeout, AgentConfig agentConfig) {
-        return Props.create(Master.class, workTimeout, agentConfig);
+    public static Props props(FiniteDuration workTimeout, AgentConfig agentConfig, boolean isRunningOnKubernetes) {
+        return Props.create(Master.class, workTimeout, agentConfig, isRunningOnKubernetes);
     }
 
     @Override
@@ -91,6 +125,17 @@ public class Master extends AbstractPersistentActor {
             for (WorkerState state : workers.values()) {
                 if (state.status.isIdle())
                     state.ref.tell(MasterWorkerProtocol.WorkIsReady.getInstance(), getSelf());
+            }
+        }
+    }
+
+    private void notifySpecificWorkers(List<String> jobList){
+        for (String job : jobList){
+            String workerId = "gatling-worker." + job;
+            WorkerState workerState = workers.get(workerId);
+
+            if(workerState.status.isIdle()){
+                workerState.ref.tell(MasterWorkerProtocol.WorkIsReady.getInstance(), getSelf());
             }
         }
     }
@@ -115,39 +160,62 @@ public class Master extends AbstractPersistentActor {
     @Override
     public Receive createReceiveRecover() {
         return receiveBuilder()
-                .match(JobDomainEvent.class, p -> {
-                    jobDatabase = jobDatabase.updated(p);
-                    log.info("Replayed {}", p.getClass().getSimpleName());
-                })
-                .match(UploadFile.class, p -> {
-                    log.info("Replayed {}", p.getClass().getSimpleName());
-                })
-                .build();
+            .match(JobDomainEvent.class, p -> {
+                jobDatabase = jobDatabase.updated(p);
+                log.info("Replayed {}", p.getClass().getSimpleName());
+            })
+            .match(UploadFile.class, p -> {
+                log.info("Replayed {}", p.getClass().getSimpleName());
+            })
+            .build();
     }
 
     @Override
     public Receive createReceive() {
         return receiveBuilder()
-                .match(MasterWorkerProtocol.RegisterWorker.class, cmd -> onRegisterWorker(cmd))
-                .match(MasterWorkerProtocol.WorkerRequestsFile.class, cmd -> onWorkerRequestsFile(cmd))
-                .match(MasterWorkerProtocol.WorkerRequestsWork.class, cmd -> onWorkerRequestsWork(cmd))
-                .match(Worker.FileUploadComplete.class, cmd -> onFileUploadComplete(cmd))
-                .match(MasterWorkerProtocol.WorkInProgress.class, cmd -> onWorkInProgress(cmd))
-                .match(MasterWorkerProtocol.WorkIsDone.class, cmd -> onWorkIsDone(cmd))
-                .match(MasterWorkerProtocol.WorkFailed.class, cmd -> onWorkFailed(cmd))
-                .match(UploadInfo.class, cmd -> onUploadInfo(cmd))
-                .match(ServerInfo.class, cmd -> onServerInfo(cmd))
-                .match(TrackingInfo.class, cmd -> onTrackingInfo(cmd))
-                .match(Report.class, cmd -> onReport(cmd))
-                .match(UploadFile.class, cmd -> onUploadFile(cmd))
-                .match(Job.class, cmd -> onJob(cmd))
-                .match(MasterClientProtocol.CommandLineJob.class, cmd -> processCmdLineJob(cmd))
-                .match(JobSummaryInfo.class, cmd -> onJobSummary())
-                .matchEquals(CleanupTick, cmd -> onCleanupTick())
-                .matchAny(cmd -> unhandled(cmd))
-                .build();
+            .match(MasterWorkerProtocol.RegisterWorker.class, cmd -> onRegisterWorker(cmd))
+            .match(MasterWorkerProtocol.WorkerRequestsFile.class, cmd -> onWorkerRequestsFile(cmd))
+            .match(MasterWorkerProtocol.WorkerRequestsWork.class, cmd -> onWorkerRequestsWork(cmd))
+            .match(Worker.FileUploadComplete.class, cmd -> onFileUploadComplete(cmd))
+            .match(MasterWorkerProtocol.WorkInProgress.class, cmd -> onWorkInProgress(cmd))
+            .match(MasterWorkerProtocol.WorkIsDone.class, cmd -> onWorkIsDone(cmd))
+            .match(MasterWorkerProtocol.WorkFailed.class, cmd -> onWorkFailed(cmd))
+            .match(UploadInfo.class, cmd -> onUploadInfo(cmd))
+            .match(ServerInfo.class, cmd -> onServerInfo(cmd))
+            .match(TrackingInfo.class, cmd -> onTrackingInfo(cmd))
+            .match(Report.class, cmd -> onReport(cmd))
+            .match(UploadFile.class, cmd -> onUploadFile(cmd))
+            .match(Job.class, cmd -> onJob(cmd))
+            .match(MasterClientProtocol.CommandLineJob.class, cmd -> processCmdLineJob(cmd))
+            .match(JobSummaryInfo.class, cmd -> onJobSummary())
+            .match(ReportExecutor.ReportResult.class, cmd -> storeReportResult(cmd))
+            .matchEquals(CleanupTick, cmd -> onCleanupTick())
+            .matchAny(cmd -> unhandled(cmd))
+            .build();
     }
 
+    private void storeReportResult(ReportExecutor.ReportResult resultReport) {
+        String trackingId = resultReport.report.trackingId;
+        this.reportPerTrackingIdCache.put(trackingId, resultReport);
+
+        KubernetesService kube = new KubernetesService();
+
+        try {
+            for (WorkerState workerState : workersPerTrakingIdCache.get(trackingId)) {
+                getContext().stop(workerState.ref);
+            }
+        }catch (ExecutionException e){
+            log.warning("Error while stopping workers");
+        }
+
+        for(String job : jobsPerTrackingID.get(trackingId)){
+            kube.deleteDeployment(job);
+            log.info("Destroyed pod for worker: gatling-worker.{}", job);
+            workers.remove(("gatling-worker." + job));
+        }
+        workersPerTrakingIdCache.asMap().remove(trackingId);
+        jobsPerTrackingID.remove(trackingId);
+    }
 
     private void onJobSummary() {
         getSender().tell(ImmutableList.copyOf(jobDatabase.getJobSummary().values()), getSelf());
@@ -190,28 +258,28 @@ public class Master extends AbstractPersistentActor {
         List<String> parameters = Arrays.asList(clientConfig.getParameterString().split(" "));
         boolean hasResourcesFeed = !clientConfig.getResourcesFeedPath().isEmpty();
         JobSummary.JobInfo jobinfo = JobSummary.JobInfo.newBuilder()
-                .withCount(clientConfig.getParallelism())
-                .withJobName("gatling")
-                .withPartitionAccessKey(clientConfig.getAccessKey())
-                .withPartitionName(clientConfig.getPartitionName())
-                .withUser(clientConfig.getUserName())
-                .withTrackingId(trackingId)
-                .withHasResourcesFeed(hasResourcesFeed)
-                .withParameterString(clientConfig.getParameterString())
-                .withFileFullName(clientConfig.getJarFileName())//class name is not fileName
-                .withResourcesFileName((clientConfig.getResourcesFeedFileName()))
-                .withJarFileName(clientConfig.getJarFileName())
-                .build();
+            .withCount(clientConfig.getParallelism())
+            .withJobName("gatling")
+            .withPartitionAccessKey(clientConfig.getAccessKey())
+            .withPartitionName(clientConfig.getPartitionName())
+            .withUser(clientConfig.getUserName())
+            .withTrackingId(trackingId)
+            .withHasResourcesFeed(hasResourcesFeed)
+            .withParameterString(clientConfig.getParameterString())
+            .withFileFullName(clientConfig.getJarFileName())//class name is not fileName
+            .withResourcesFileName((clientConfig.getResourcesFeedFileName()))
+            .withJarFileName(clientConfig.getJarFileName())
+            .build();
         for (int i = 0; i < clientConfig.getParallelism(); i++) {
             TaskEvent taskEvent = new TaskEvent();
             taskEvent.setJobName("gatling"); //the gatling.sh script is the gateway for simulation files
             taskEvent.setJobInfo(jobinfo);
             taskEvent.setParameters(new ArrayList<>(parameters));
             Job job = new Job(clientConfig.getPartitionName(), taskEvent, trackingId,
-                    agentConfig.getAbortUrl(),
-                    agentConfig.getJobFileUrl(clientConfig.getJarPath()),
-                    agentConfig.getJobFileUrl(clientConfig.getResourcesFeedPath()),
-                    true);
+                              agentConfig.getAbortUrl(),
+                              agentConfig.getJobFileUrl(clientConfig.getJarPath()),
+                              agentConfig.getJobFileUrl(clientConfig.getResourcesFeedPath()),
+                              true);
             persist(new JobState.JobAccepted(job), event -> {
                 // Ack back to original sender
                 getSender().tell(new MasterClientProtocol.CommandLineJobAccepted(job), getSelf());
@@ -235,7 +303,27 @@ public class Master extends AbstractPersistentActor {
                 // Ack back to original sender
                 getSender().tell(new Ack(event.job.jobId), getSelf());
                 jobDatabase = jobDatabase.updated(event);
-                notifyWorkers();
+
+                if(this.isRunningOnKubernetes){
+                    KubernetesService kubernetesService = new KubernetesService();
+                    String deploymentName = kubernetesService.createDeploy(cmd.jobId);
+                    kubernetesService.waitUntilDeploymentIsReady(deploymentName, 1);
+
+                    log.info("Kubernetes pod is up for work: {}", cmd.jobId);
+
+                    if(jobsPerTrackingID.containsKey(cmd.trackingId)){
+                        jobsPerTrackingID.get(cmd.trackingId).add(cmd.jobId);
+                    }else{
+                        jobsPerTrackingID.put(cmd.trackingId, new ArrayList<String>());
+                        jobsPerTrackingID.get(cmd.trackingId).add(cmd.jobId);
+                    }
+
+                    if( jobsPerTrackingID.get(cmd.trackingId).size() == cmd.expectedWorkers){
+                        log.info("All the work for simulation {} is registered", cmd.trackingId);
+                    }
+                } else {
+                    notifyWorkers();
+                }
             });
         }
     }
@@ -251,8 +339,21 @@ public class Master extends AbstractPersistentActor {
 
     private void onReport(Object cmd) {
         log.info("Accepted report request: {}", cmd);
-        List<Worker.Result> result = jobDatabase.getCompletedResults(((Report) cmd).trackingId);
-        reportExecutor.forward(new GenerateReport((Report) cmd, result), getContext());
+        if(this.isRunningOnKubernetes) {
+            String trackingId = ((Report) cmd).trackingId;
+
+            try {
+                getSender().tell(reportPerTrackingIdCache.get(trackingId), getSelf());
+
+            } catch (ExecutionException e) {
+
+            }
+
+        }
+        else {
+            List<Worker.Result> result = jobDatabase.getCompletedResults(((Report) cmd).trackingId);
+            reportExecutor.forward(new GenerateReport((Report) cmd, result), getContext());
+        }
     }
 
     private void onTrackingInfo(Object cmd) {
@@ -297,7 +398,12 @@ public class Master extends AbstractPersistentActor {
         final String workerId = workDone.workerId;
         final String workId = workDone.workId;
         if (jobDatabase.isDone(workId)) {
-            getSender().tell(new Ack(workId), getSelf());
+            if (this.isRunningOnKubernetes){
+                getSender().tell(new AckKubernetes(workId), getSelf());
+            } else {
+                getSender().tell(new Ack(workId), getSelf());
+            }
+
         } else if (!jobDatabase.isInProgress(workId)) {
             log.info("Work {} not in progress, reported as done by worker {}", workId, workerId);
         } else {
@@ -305,7 +411,27 @@ public class Master extends AbstractPersistentActor {
             changeWorkerToIdle(workerId);
             persist(new JobState.JobCompleted(workId, cmd.result), event -> {
                 jobDatabase = jobDatabase.updated(event);
-                getSender().tell(new Ack(event.workId), getSelf());
+
+                if (this.isRunningOnKubernetes){
+                    getSender().tell(new AckKubernetes(event.workId), getSelf());
+                } else {
+                    getSender().tell(new Ack(event.workId), getSelf());
+                }
+
+                if (this.isRunningOnKubernetes){
+                    String trackingId = jobsPerTrackingID.keySet().stream().filter(key -> jobsPerTrackingID.get(key).contains(cmd.workId)).collect(Collectors.toList()).get(0);
+
+                    if (jobsPerTrackingID.size() == jobDatabase.getCompletedResults(trackingId).size()){
+                        log.info("All work is done for simulation {}", trackingId);
+                        List<Worker.Result> result = jobDatabase.getCompletedResults(trackingId);
+
+                        TaskEvent taskEvent = new TaskEvent();
+                        taskEvent.setJobName("gatling");
+                        taskEvent.setParameters(new ArrayList<>(Arrays.asList("-ro")));
+                        reportExecutor.tell(new GenerateReport(new Master.Report(trackingId, taskEvent), result), getSelf());
+                    }
+                }
+
             });
         }
     }
@@ -332,31 +458,43 @@ public class Master extends AbstractPersistentActor {
         log.info("Worker requested work: {}", cmd);
         MasterWorkerProtocol.WorkerRequestsWork workReqMsg = cmd;
         final String workerId = workReqMsg.workerId;
-        if (jobDatabase.hasJob()) {
-            final WorkerState state = workers.get(workerId);
-            if (state != null && state.status.isIdle()) {
-                //for (int i=0; i<jobDatabase.getPendingJobsCount(); i++) {
-                final Job job = jobDatabase.nextJob();//nextJob for the partition/role
-                boolean jobWorkerRoleMatched = workReqMsg.role.equalsIgnoreCase(job.roleId);
-                if (jobWorkerRoleMatched) {
-                    persist(new JobState.JobStarted(job.jobId, workerId), event -> {
-                        jobDatabase = jobDatabase.updated(event);
-                        log.info("Giving worker {} some taskEvent {}", workerId, event.workId);
-                        workers.put(workerId, state.copyWithStatus(new Busy(event.workId, workTimeout.fromNow())));
-                        getSender().tell(job, getSelf());
-                    });
-                } else {
-                    persist(new JobState.JobPostponed(job.jobId), event -> {
-                        jobDatabase = jobDatabase.updated(event);
-                        log.info("Postponing work: {}", workerId);
-                    });
-                    extendIdleExpiryTime(workerId);
+
+        final WorkerState state = workers.get(workerId);
+        if (this.isRunningOnKubernetes) {
+            final Job job = jobDatabase.hasJob(workerId.split("\\.")[1]);
+
+            persist(new JobState.JobStarted(job.jobId, workerId), event -> {
+                jobDatabase = jobDatabase.updated(event);
+                log.info("Giving worker {} some taskEvent {}", workerId, event.workId);
+                workers.put(workerId, state.copyWithStatus(new Busy(event.workId, workTimeout.fromNow())));
+                getSender().tell(job, getSelf());
+            });
+        } else {
+            if (jobDatabase.hasJob()) {
+
+                if (state != null && state.status.isIdle()) {
+
+                    final Job job = jobDatabase.nextJob();//nextJob for the partition/role
+                    boolean jobWorkerRoleMatched = workReqMsg.role.equalsIgnoreCase(job.roleId);
+
+                    if (jobWorkerRoleMatched) {
+                        persist(new JobState.JobStarted(job.jobId, workerId), event -> {
+                            jobDatabase = jobDatabase.updated(event);
+                            log.info("Giving worker {} some taskEvent {}", workerId, event.workId);
+                            workers.put(workerId, state.copyWithStatus(new Busy(event.workId, workTimeout.fromNow())));
+                            getSender().tell(job, getSelf());
+                        });
+                    } else {
+                        persist(new JobState.JobPostponed(job.jobId), event -> {
+                            jobDatabase = jobDatabase.updated(event);
+                            log.info("Postponing work: {}", workerId);
+                        });
+                        extendIdleExpiryTime(workerId);
+                    }
                 }
-                //}
+            } else {
+                extendIdleExpiryTime(workerId);
             }
-        }
-        else {
-            extendIdleExpiryTime(workerId);
         }
     }
 
@@ -389,9 +527,34 @@ public class Master extends AbstractPersistentActor {
             workers.put(workerId, workers.get(workerId).copyWithRef(getSender()));
         } else {
             log.info("Worker registered: {}", workerId);
-            workers.put(workerId, new WorkerState(getSender(), new Idle(workTimeout.fromNow())));
-            if (jobDatabase.hasJob()) {
-                getSender().tell(MasterWorkerProtocol.WorkIsReady.getInstance(), getSelf());
+            WorkerState workerState = new WorkerState(getSender(), new Idle(workTimeout.fromNow()));
+            workers.put(workerId, workerState );
+            if (this.isRunningOnKubernetes){
+                String jobId = workerId.split("\\.")[1];
+//                String trackingId = jobsPerTrackingID.keySet().stream().filter(key -> jobsPerTrackingID.get(key).contains(jobId)).collect(Collectors.toList()).get(0);
+                for(String trackingId : jobsPerTrackingID.keySet()){
+                    if (jobsPerTrackingID.get(trackingId).contains(jobId)){
+                        try{
+                            if(workersPerTrakingIdCache.asMap().containsKey(trackingId)) {
+                                workersPerTrakingIdCache.get(trackingId).add(workerState);
+                            } else {
+                                workersPerTrakingIdCache.put(trackingId, new ArrayList<>());
+                                workersPerTrakingIdCache.get(trackingId).add(workerState);
+                            }
+
+                            if(workersPerTrakingIdCache.get(trackingId).size() == jobsPerTrackingID.get(trackingId).size()){
+                                notifySpecificWorkers(jobsPerTrackingID.get(trackingId));
+                            }
+                        }catch (Exception e){
+
+                        }
+                        break;
+                    }
+                }
+            } else {
+                if (jobDatabase.hasJob()) {
+                    getSender().tell(MasterWorkerProtocol.WorkIsReady.getInstance(), getSelf());
+                }
             }
         }
     }
@@ -525,6 +688,9 @@ public class Master extends AbstractPersistentActor {
         public String jobFileUrl;
         public String resourcesFileUrl;
 
+
+        public int expectedWorkers;
+
         public Job(String roleId, Object job, String trackingId, String abortUrl, String jobFileUrl, String resourcesFileUrl, boolean isJarSimulation) {
             this.jobId = UUID.randomUUID().toString();
             this.roleId = roleId;
@@ -536,18 +702,24 @@ public class Master extends AbstractPersistentActor {
             this.isJarSimulation = isJarSimulation;
         }
 
+        public Job(String roleId, Object job, String trackingId, String abortUrl, String jobFileUrl, String resourcesFileUrl, boolean isJarSimulation, int expectedWorkers) {
+            this(roleId, job, trackingId, abortUrl, jobFileUrl, resourcesFileUrl, isJarSimulation);
+
+            this.expectedWorkers = expectedWorkers;
+        }
+
         @Override
         public String toString() {
             return "Job{" +
-                    "taskEvent=" + taskEvent +
-                    ", jobId='" + jobId + '\'' +
-                    ", roleId='" + roleId + '\'' +
-                    ", trackingId='" + trackingId + '\'' +
-                    ", isJarSimulation=" + isJarSimulation +
-                    ", abortUrl='" + abortUrl + '\'' +
-                    ", jobFileUrl='" + jobFileUrl + '\'' +
-                    ", resourcesFileUrl='" + resourcesFileUrl + '\'' +
-                    '}';
+                   "taskEvent=" + taskEvent +
+                   ", jobId='" + jobId + '\'' +
+                   ", roleId='" + roleId + '\'' +
+                   ", trackingId='" + trackingId + '\'' +
+                   ", isJarSimulation=" + isJarSimulation +
+                   ", abortUrl='" + abortUrl + '\'' +
+                   ", jobFileUrl='" + jobFileUrl + '\'' +
+                   ", resourcesFileUrl='" + resourcesFileUrl + '\'' +
+                   '}';
         }
     }
 
@@ -567,11 +739,11 @@ public class Master extends AbstractPersistentActor {
         @Override
         public String toString() {
             return "FileJob{" +
-                    "content='" + content + '\'' +
-                    ", remotePath='" + remotePath + '\'' +
-                    ", jobId='" + jobId + '\'' +
-                    ", uploadFileRequest=" + uploadFileRequest +
-                    '}';
+                   "content='" + content + '\'' +
+                   ", remotePath='" + remotePath + '\'' +
+                   ", jobId='" + jobId + '\'' +
+                   ", uploadFileRequest=" + uploadFileRequest +
+                   '}';
         }
     }
 
@@ -596,12 +768,12 @@ public class Master extends AbstractPersistentActor {
         @Override
         public String toString() {
             return "UploadFile{" +
-                    "trackingId='" + trackingId + '\'' +
-                    ", path='" + path + '\'' +
-                    ", name='" + name + '\'' +
-                    ", role='" + role + '\'' +
-                    ", type='" + type + '\'' +
-                    '}';
+                   "trackingId='" + trackingId + '\'' +
+                   ", path='" + path + '\'' +
+                   ", name='" + name + '\'' +
+                   ", role='" + role + '\'' +
+                   ", type='" + type + '\'' +
+                   '}';
         }
     }
 
@@ -617,8 +789,8 @@ public class Master extends AbstractPersistentActor {
         @Override
         public String toString() {
             return "Report{" +
-                    "trackingId='" + trackingId + '\'' +
-                    '}';
+                   "trackingId='" + trackingId + '\'' +
+                   '}';
         }
 
         public String getHtml() {
@@ -638,9 +810,9 @@ public class Master extends AbstractPersistentActor {
         @Override
         public String toString() {
             return "GenerateReport{" +
-                    "reportJob=" + reportJob +
-                    ", results=" + results +
-                    '}';
+                   "reportJob=" + reportJob +
+                   ", results=" + results +
+                   '}';
         }
     }
 
@@ -661,9 +833,9 @@ public class Master extends AbstractPersistentActor {
         @Override
         public String toString() {
             return "TrackingInfo{" +
-                    "trackingId='" + trackingId + '\'' +
-                    ", cancel=" + cancel +
-                    '}';
+                   "trackingId='" + trackingId + '\'' +
+                   ", cancel=" + cancel +
+                   '}';
         }
     }
 
@@ -682,9 +854,9 @@ public class Master extends AbstractPersistentActor {
         @Override
         public String toString() {
             return "UploadInfo{" +
-                    "trackingId='" + trackingId + '\'' +
-                    ", hosts=" + hosts +
-                    '}';
+                   "trackingId='" + trackingId + '\'' +
+                   ", hosts=" + hosts +
+                   '}';
         }
     }
 
@@ -709,8 +881,8 @@ public class Master extends AbstractPersistentActor {
         @Override
         public String toString() {
             return "ServerInfo{" +
-                    "workers=" + getWorkers() +
-                    '}';
+                   "workers=" + getWorkers() +
+                   '}';
         }
     }
 
@@ -729,5 +901,23 @@ public class Master extends AbstractPersistentActor {
         public String toString() {
             return "Ack{" + "jobId='" + workId + '\'' + '}';
         }
+    }
+
+    public static final class AckKubernetes implements  Serializable {
+        final String workId;
+
+        public AckKubernetes(String workId) {
+            this.workId = workId;
+        }
+
+        public String getWorkId() {
+            return workId;
+        }
+
+        @Override
+        public String toString() {
+            return "AckKubernetes{" + "jobId='" + workId + '\'' + '}';
+        }
+
     }
 }

@@ -1,7 +1,7 @@
 /*
  *
  *   Copyright 2016 Walmart Technology
- *  
+ *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
  *   You may obtain a copy of the License at
@@ -100,9 +100,10 @@ public class SystemConfig {
     public ActorSystem createActorSystemWithMaster(AgentConfig agentConfig,
                                                    @Value("${master.port}") int port,
                                                    @Value("${master.name}") String masterName,
-                                                   @Value("${master.primary}") boolean isPrimary) {
+                                                   @Value("${master.primary}") boolean isPrimary,
+                                                   @Value("${master.kubernetes}") boolean isRunningOnKubernetes) {
 
-        return ClusterFactory.startMaster(port,masterName,isPrimary,agentConfig);
+        return ClusterFactory.startMaster(port,masterName,isPrimary,agentConfig,isRunningOnKubernetes);
     }
 
 

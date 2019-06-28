@@ -1,7 +1,7 @@
 /*
  *
  *   Copyright 2016 Walmart Technology
- *  
+ *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
  *   You may obtain a copy of the License at
@@ -57,17 +57,17 @@ public class ClusterFactory {
      * @param agentConfig
      * @return
      */
-    public static ActorSystem startMaster(int port, String role, boolean isPrimary,AgentConfig agentConfig) {
+    public static ActorSystem startMaster(int port, String role, boolean isPrimary,AgentConfig agentConfig, boolean isRunningOnKubernetes) {
         String ip = HostUtils.lookupIp();
         String seed = String.format("akka.cluster.seed-nodes=[\"akka.tcp://%s@%s:%s\"]", Constants.PerformanceSystem, ip ,port);
         Config conf = ConfigFactory.parseString("akka.cluster.roles=[" + role + "]").
-                withFallback(ConfigFactory.parseString("akka.remote.netty.tcp.port=" + port)).
-                withFallback(ConfigFactory.parseString("akka.remote.netty.tcp.hostname=" + ip)).
-                withFallback(ConfigFactory.parseString(seed)).
-                withFallback(ConfigFactory.load("application"));
+            withFallback(ConfigFactory.parseString("akka.remote.netty.tcp.port=" + port)).
+            withFallback(ConfigFactory.parseString("akka.remote.netty.tcp.hostname=" + ip)).
+            withFallback(ConfigFactory.parseString(seed)).
+            withFallback(ConfigFactory.load("application"));
 
         ActorSystem system = ActorSystem.create(Constants.PerformanceSystem, conf);
-        ClusterFactory.getMaster(port,role,isPrimary,system,agentConfig,ip);
+        ClusterFactory.getMaster(port,role,isPrimary,system,agentConfig,ip, isRunningOnKubernetes);
         return system;
     }
 
@@ -81,16 +81,16 @@ public class ClusterFactory {
      * @param ip
      * @return
      */
-    public static ActorRef  getMaster(int port,String role, boolean isPrimary, ActorSystem system, AgentConfig agentConfig,String ip) {
+    public static ActorRef  getMaster(int port,String role, boolean isPrimary, ActorSystem system, AgentConfig agentConfig,String ip, boolean isRunningOnKubernetes) {
         String journalPath = String.format("akka.tcp://%s@%s:%s/user/store", Constants.PerformanceSystem,  ip ,port);
         startupSharedJournal(system, isPrimary, ActorPath$.MODULE$.fromString(journalPath));
         FiniteDuration workTimeout = Duration.create(120, "seconds");
         final ClusterSingletonManagerSettings settings =
-                ClusterSingletonManagerSettings.create(system).withRole(role);
+            ClusterSingletonManagerSettings.create(system).withRole(role);
 
         ActorRef ref = system.actorOf(
-                ClusterSingletonManager.props(Master.props(workTimeout,agentConfig), PoisonPill.getInstance(), settings),
-                "master");
+            ClusterSingletonManager.props(Master.props(workTimeout,agentConfig,isRunningOnKubernetes), PoisonPill.getInstance(), settings),
+            "master");
         return ref;
     }
 

@@ -1,7 +1,7 @@
 /*
  *
  *   Copyright 2016 Walmart Technology
- *  
+ *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
  *   You may obtain a copy of the License at
@@ -47,7 +47,7 @@ public class Worker extends AbstractActor {
     private final ActorRef clusterClient;
     private final String host;
     private String workerRole;
-    private final String workerId = UUID.randomUUID().toString();
+    private final String workerId;
     private final ActorRef workExecutor;
     private final Cancellable registerTask;
     private LoggingAdapter log = Logging.getLogger(getContext().system(), this);
@@ -64,22 +64,22 @@ public class Worker extends AbstractActor {
                 getContext().setReceiveTimeout(Duration.create(5, "seconds"));
                 Procedure<Object> waitForWorkIsDoneAck = waitForWorkIsDoneAck(result);
                 getContext().become(receiveBuilder()
-                        .matchAny(p -> waitForWorkIsDoneAck.apply(p))
-                        .build());
+                                        .matchAny(p -> waitForWorkIsDoneAck.apply(p))
+                                        .build());
             }
             else if (message instanceof  Worker.FileUploadComplete){
                 sendToMaster(message);
                 getContext().become(receiveBuilder()
-                        .matchAny(p->idle.apply(p))
-                        .build());
+                                        .matchAny(p->idle.apply(p))
+                                        .build());
             }
             else if (message instanceof WorkFailed) {
                 Object result = ((WorkFailed) message).result;
                 log.info("Work is failed. Result {}.", result);
                 sendToMaster(new MasterWorkerProtocol.WorkFailed(workerId, jobId(),result));
                 getContext().become(receiveBuilder()
-                        .matchAny(p->idle.apply(p))
-                        .build());
+                                        .matchAny(p->idle.apply(p))
+                                        .build());
                 //getContext().setReceiveTimeout(Duration.create(5, "seconds"));
                 ///Procedure<Object> waitForWorkIsDoneAck = waitForWorkIsDoneAck(result);
                 //getContext().become(waitForWorkIsDoneAck);
@@ -110,8 +110,8 @@ public class Worker extends AbstractActor {
                 currentJobId = job.jobId;
                 workExecutor.tell(job, getSelf());
                 getContext().become(receiveBuilder()
-                        .matchAny(p->working.apply(p))
-                        .build());
+                                        .matchAny(p->working.apply(p))
+                                        .build());
             }
             else if (message instanceof Master.FileJob) {
                 Master.FileJob fileJob = (Master.FileJob) message;
@@ -119,11 +119,11 @@ public class Worker extends AbstractActor {
                 currentJobId = fileJob.jobId;
                 workExecutor.tell(fileJob, getSelf());
                 getContext().become(receiveBuilder()
-                        .matchAny(p->working.apply(p))
-                        .build());
+                                        .matchAny(p->working.apply(p))
+                                        .build());
             }
             else
-             unhandled(message);
+                unhandled(message);
         }
     };
 
@@ -137,17 +137,22 @@ public class Worker extends AbstractActor {
     public Worker(ActorRef clusterClient, Props workExecutorProps, FiniteDuration registerInterval, String workerRole) {
         this.clusterClient = clusterClient;
         this.workerRole = workerRole;
+        if (System.getenv("HOSTNAME") == null || !System.getenv("HOSTNAME").contains("-")){
+            this.workerId = UUID.randomUUID().toString();
+        }else{
+            this.workerId =  System.getenv("HOSTNAME").substring(0,System.getenv("HOSTNAME").lastIndexOf("-"));
+        }
         this.host = HostUtils.lookupIp();
         this.workExecutor = getContext().watch(getContext().actorOf(workExecutorProps, "exec"));
         this.registerTask = getContext().system().scheduler().schedule
-                (
-                        Duration.Zero(),
-                        registerInterval,
-                        clusterClient,
-                        new ClusterClient.SendToAll("/user/master/singleton", new MasterWorkerProtocol.RegisterWorker(workerId)),
-                        getContext().dispatcher(),
-                        getSelf()
-                );
+            (
+                Duration.Zero(),
+                registerInterval,
+                clusterClient,
+                new ClusterClient.SendToAll("/user/master/singleton", new MasterWorkerProtocol.RegisterWorker(workerId)),
+                getContext().dispatcher(),
+                getSelf()
+            );
         FiniteDuration workTimeout = Duration.create(60, "seconds");
         this.keepAliveTask = getContext().system().scheduler().schedule(workTimeout.div(2), workTimeout.div(2), getSelf(), KeepAliveTick, getContext().dispatcher(), getSelf());
     }
@@ -170,37 +175,37 @@ public class Worker extends AbstractActor {
     @Override
     public SupervisorStrategy supervisorStrategy() {
         return new OneForOneStrategy(-1, Duration.Inf(),
-                t -> {
-                    log.info("Throwable, Work is failed for1 "+ t);
-                    if (t instanceof ActorInitializationException)
-                        return stop();
-                    else if (t instanceof DeathPactException)
-                        return stop();
-                    else if (t instanceof RuntimeException) {
-                        if (currentJobId!=null) {
-                            log.info("RuntimeException, Work is failed for "+ currentJobId);
-                            sendToMaster(new MasterWorkerProtocol.WorkFailed(workerId, jobId(),new Result(-1,"","","",null)));
-                        }
-                        getContext().become(receiveBuilder()
-                                .matchAny(p->idle.apply(p))
-                                .build());
-                        return restart();
-                    }
-                    else if (t instanceof Exception) {
-                        if (currentJobId!=null) {
-                            log.info("Exception, Work is failed for "+ currentJobId);
-                            sendToMaster(new MasterWorkerProtocol.WorkFailed(workerId, jobId(),new Result(-1,"","","",null)));
-                        }
-                        getContext().become(receiveBuilder()
-                                .matchAny(p->idle.apply(p))
-                                .build());
-                        return restart();
-                    }
-                    else {
-                        log.info("Throwable, Work is failed for "+ t);
-                        return escalate();
-                    }
-                }
+                                     t -> {
+                                         log.info("Throwable, Work is failed for1 "+ t);
+                                         if (t instanceof ActorInitializationException)
+                                             return stop();
+                                         else if (t instanceof DeathPactException)
+                                             return stop();
+                                         else if (t instanceof RuntimeException) {
+                                             if (currentJobId!=null) {
+                                                 log.info("RuntimeException, Work is failed for "+ currentJobId);
+                                                 sendToMaster(new MasterWorkerProtocol.WorkFailed(workerId, jobId(),new Result(-1,"","","",null)));
+                                             }
+                                             getContext().become(receiveBuilder()
+                                                                     .matchAny(p->idle.apply(p))
+                                                                     .build());
+                                             return restart();
+                                         }
+                                         else if (t instanceof Exception) {
+                                             if (currentJobId!=null) {
+                                                 log.info("Exception, Work is failed for "+ currentJobId);
+                                                 sendToMaster(new MasterWorkerProtocol.WorkFailed(workerId, jobId(),new Result(-1,"","","",null)));
+                                             }
+                                             getContext().become(receiveBuilder()
+                                                                     .matchAny(p->idle.apply(p))
+                                                                     .build());
+                                             return restart();
+                                         }
+                                         else {
+                                             log.info("Throwable, Work is failed for "+ t);
+                                             return escalate();
+                                         }
+                                     }
         );
     }
 
@@ -213,7 +218,7 @@ public class Worker extends AbstractActor {
     @Override
     public Receive createReceive() {
         return receiveBuilder()
-                .build();
+            .build();
     }
 
     public void onReceive(Object message) {
@@ -226,11 +231,15 @@ public class Worker extends AbstractActor {
                 sendToMaster(new MasterWorkerProtocol.WorkerRequestsWork(workerId, workerRole));
                 getContext().setReceiveTimeout(Duration.Undefined());
                 getContext().become(receiveBuilder()
-                        .matchAny(p->idle.apply(p))
-                        .build());
+                                        .matchAny(p->idle.apply(p))
+                                        .build());
+
             } else if (message instanceof ReceiveTimeout) {
                 log.info("No ack from master, retrying (" + workerId + " -> " + jobId() + ")");
                 sendToMaster(new MasterWorkerProtocol.WorkIsDone(workerId, jobId(), result));
+            } else if (message instanceof Master.AckKubernetes && ((Master.AckKubernetes) message).workId.equals(jobId())){
+                getContext().setReceiveTimeout(Duration.Undefined());
+                log.info("Workerul receive ack for work done in kubernetes");
             } else {
                 unhandled(message);
             }
@@ -239,8 +248,8 @@ public class Worker extends AbstractActor {
 
     {
         getContext().become(receiveBuilder()
-                .matchAny(p->idle.apply(p))
-                .build());
+                                .matchAny(p->idle.apply(p))
+                                .build());
     }
 
     @Override
@@ -272,8 +281,8 @@ public class Worker extends AbstractActor {
         @Override
         public String toString() {
             return "WorkComplete{" +
-                    "result=" + result +
-                    '}';
+                   "result=" + result +
+                   '}';
         }
     }
 
@@ -289,9 +298,9 @@ public class Worker extends AbstractActor {
         @Override
         public String toString() {
             return "FileUploadComplete{" +
-                    "result=" + result +
-                    ", host='" + host + '\'' +
-                    '}';
+                   "result=" + result +
+                   ", host='" + host + '\'' +
+                   '}';
         }
     }
 
@@ -305,8 +314,8 @@ public class Worker extends AbstractActor {
         @Override
         public String toString() {
             return "WorkFailed{" +
-                    "result=" + result +
-                    '}';
+                   "result=" + result +
+                   '}';
         }
     }
 
@@ -329,12 +338,12 @@ public class Worker extends AbstractActor {
         @Override
         public String toString() {
             return "Result{" +
-                    "result=" + result +
-                    ", errPath='" + errPath + '\'' +
-                    ", stdPath='" + stdPath + '\'' +
-                    ", metrics='" + metrics + '\'' +
-                    ", job=" + job +
-                    '}';
+                   "result=" + result +
+                   ", errPath='" + errPath + '\'' +
+                   ", stdPath='" + stdPath + '\'' +
+                   ", metrics='" + metrics + '\'' +
+                   ", job=" + job +
+                   '}';
         }
     }
 

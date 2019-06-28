@@ -1,7 +1,7 @@
 /*
  *
  *   Copyright 2016 Walmart Technology
- *  
+ *
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
  *   You may obtain a copy of the License at
@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.stream.Collectors;
@@ -39,6 +40,7 @@ public final class JobState {
     private final Set<String> acceptedJobIds;
     private final Set<String> doneJobIds;
     private final ConcurrentLinkedDeque<Master.Job> pendingJobs;
+    private final ConcurrentHashMap<String, Master.Job> pendingJobsKubernetes;
     private final ConcurrentLinkedQueue<Worker.Result> failedJobs;
     private final ConcurrentLinkedQueue<Worker.Result> completedJobs;
     private HashMap<String,JobSummary> jobSummary ;
@@ -51,16 +53,20 @@ public final class JobState {
         failedJobs = new ConcurrentLinkedQueue<>();
         completedJobs = new ConcurrentLinkedQueue<>();
         jobSummary = new HashMap<>();
+        pendingJobsKubernetes = new ConcurrentHashMap<>();
     }
     private JobState(JobState jobState, JobAccepted workAccepted) {
         ConcurrentLinkedDeque<Master.Job> tmp_pendingJob = new ConcurrentLinkedDeque<Master.Job>(jobState.pendingJobs);
+        ConcurrentHashMap<String, Master.Job> tmp_pendingJobKubernetes = new ConcurrentHashMap<>(jobState.pendingJobsKubernetes);
         Set<String> tmp_acceptedWorkIds = new HashSet<String>(jobState.acceptedJobIds);
         tmp_pendingJob.addLast(workAccepted.job);
+        tmp_pendingJobKubernetes.put(workAccepted.job.jobId, workAccepted.job);
         tmp_acceptedWorkIds.add(workAccepted.job.jobId);
         jobsInProgress = new HashMap<>(jobState.jobsInProgress);
         acceptedJobIds = tmp_acceptedWorkIds;
         doneJobIds = new HashSet<String>(jobState.doneJobIds);
         pendingJobs = tmp_pendingJob;
+        pendingJobsKubernetes = tmp_pendingJobKubernetes;
         failedJobs = new ConcurrentLinkedQueue<>(jobState.failedJobs);
         completedJobs = new ConcurrentLinkedQueue<>(jobState.completedJobs);
         jobSummary = new HashMap<>(jobState.jobSummary);
@@ -75,16 +81,18 @@ public final class JobState {
         taskInfo.setTaskJobId(workAccepted.job.jobId);
         taskInfo.setStatus(JobStatusString.PENDING);
         summary.addTask(taskInfo);
-
-
     }
 
 
     public JobState(JobState jobState, JobStarted workStarted) {
         ConcurrentLinkedDeque<Master.Job> tmp_pendingJob = new ConcurrentLinkedDeque<>(jobState.pendingJobs);
+        ConcurrentHashMap<String, Master.Job> tmp_pendingJobKubernetes = new ConcurrentHashMap<>(jobState.pendingJobsKubernetes);
         Map<String, Master.Job> tmp_workInProgress = new HashMap<>(jobState.jobsInProgress);
 
-        Master.Job job = tmp_pendingJob.removeFirst();
+        Master.Job job1 = tmp_pendingJob.removeFirst();
+        Master.Job job = tmp_pendingJobKubernetes.get(workStarted.workId);
+        tmp_pendingJobKubernetes.remove(workStarted.workId);
+
         if (!job.jobId.equals(workStarted.workId)) {
             throw new IllegalArgumentException("WorkStarted expected jobId " + job.jobId + "==" + workStarted.workId);
         }
@@ -94,6 +102,7 @@ public final class JobState {
         acceptedJobIds = new HashSet<String>(jobState.acceptedJobIds);
         doneJobIds = new HashSet<String>(jobState.doneJobIds);
         pendingJobs = tmp_pendingJob;
+        pendingJobsKubernetes = tmp_pendingJobKubernetes;
         failedJobs = new ConcurrentLinkedQueue<>(jobState.failedJobs);
         completedJobs = new ConcurrentLinkedQueue<>(jobState.completedJobs);
         jobSummary = new HashMap<>(jobState.jobSummary);
@@ -117,6 +126,7 @@ public final class JobState {
 
         doneJobIds = tmp_doneWorkIds;
         pendingJobs = new ConcurrentLinkedDeque<Master.Job>(jobState.pendingJobs);
+        pendingJobsKubernetes = new ConcurrentHashMap<>(jobState.pendingJobsKubernetes);
         failedJobs = new ConcurrentLinkedQueue<>(jobState.failedJobs);
 
         List<Worker.Result> tmp_completed = new ArrayList<>(jobState.completedJobs);
@@ -138,6 +148,7 @@ public final class JobState {
     public JobState(JobState jobState, JobFailed jobFailed) {
         Map<String, Master.Job> tmp_workInProgress = new HashMap<String, Master.Job>(jobState.jobsInProgress);
         ConcurrentLinkedDeque<Master.Job> tmp_pendingJob = new ConcurrentLinkedDeque<Master.Job>(jobState.pendingJobs);
+        ConcurrentHashMap<String, Master.Job> tmp_pendingJobKubernetes = new ConcurrentHashMap<>(jobState.pendingJobsKubernetes);
         Set<String> acceptedJobIds_tmp = new HashSet<>(jobState.acceptedJobIds);
         acceptedJobIds_tmp.remove(jobFailed.workId);
         //tmp_pendingJob.addLast(jobState.jobsInProgress.get(failedJobs.workId));
@@ -146,6 +157,7 @@ public final class JobState {
         acceptedJobIds = acceptedJobIds_tmp;
         doneJobIds = new HashSet<>(jobState.doneJobIds);
         pendingJobs = tmp_pendingJob;
+        pendingJobsKubernetes = tmp_pendingJobKubernetes;
 
         completedJobs = new ConcurrentLinkedQueue<>(jobState.completedJobs);
 
@@ -168,12 +180,14 @@ public final class JobState {
     public JobState(JobState jobState, JobTimedOut jobTimedOut) {
         Map<String, Master.Job> tmp_workInProgress = new HashMap<String, Master.Job>(jobState.jobsInProgress);
         ConcurrentLinkedDeque<Master.Job> tmp_pendingJob = new ConcurrentLinkedDeque<Master.Job>(jobState.pendingJobs);
+        ConcurrentHashMap<String, Master.Job> tmp_pendingJobKubernetes = new ConcurrentHashMap<>(jobState.pendingJobsKubernetes);
         tmp_pendingJob.addLast(jobState.jobsInProgress.get(jobTimedOut.workId));
         tmp_workInProgress.remove(jobTimedOut.workId);
         jobsInProgress = tmp_workInProgress;
         acceptedJobIds = new HashSet<String>(jobState.acceptedJobIds);
         doneJobIds = new HashSet<String>(jobState.doneJobIds);
         pendingJobs = tmp_pendingJob;
+        pendingJobsKubernetes = tmp_pendingJobKubernetes;
         failedJobs = new ConcurrentLinkedQueue<>(jobState.failedJobs);
         completedJobs = new ConcurrentLinkedQueue<>(jobState.completedJobs);
         jobSummary = new HashMap<>(jobState.jobSummary);
@@ -189,12 +203,14 @@ public final class JobState {
 
     public JobState(JobState jobState, JobPostponed jobPostponed) {
         ConcurrentLinkedDeque<Master.Job> tmp_pendingJob = new ConcurrentLinkedDeque<Master.Job>(jobState.pendingJobs);
+        ConcurrentHashMap<String, Master.Job> tmp_pendingJobKubernetes = new ConcurrentHashMap<>(jobState.pendingJobsKubernetes);
         Set<String> tmp_acceptedWorkIds = new HashSet<String>(jobState.acceptedJobIds);
         tmp_pendingJob.addLast(tmp_pendingJob.removeFirst());
         jobsInProgress = new HashMap<String, Master.Job>(jobState.jobsInProgress);
         acceptedJobIds = new HashSet<String>(jobState.acceptedJobIds);
         doneJobIds = new HashSet<String>(jobState.doneJobIds);
         pendingJobs = tmp_pendingJob;
+        pendingJobsKubernetes = tmp_pendingJobKubernetes;
         failedJobs = new ConcurrentLinkedQueue<>(jobState.failedJobs);
         completedJobs = new ConcurrentLinkedQueue<>(jobState.completedJobs);
         jobSummary = new HashMap<>(jobState.jobSummary);
@@ -243,6 +259,10 @@ public final class JobState {
         return pendingJobs.getFirst();
     }
 
+    public Master.Job hasJob(String jobId){
+        return pendingJobsKubernetes.get(jobId);
+    }
+
     public boolean hasJob() {
         return !pendingJobs.isEmpty();
     }
@@ -264,26 +284,32 @@ public final class JobState {
     }
 
     public TrackingResult getTrackingInfo(String trackingId) {
-        long pendingCount = pendingJobs.stream().filter(p -> p.trackingId.equalsIgnoreCase(trackingId)).count();
+        long pendingCount = 0;
+
+        if(pendingJobsKubernetes.size() != 0){
+            pendingCount = pendingJobsKubernetes.values().stream().filter(p -> p.trackingId.equalsIgnoreCase(trackingId)).count();
+        } else {
+            pendingCount = pendingJobs.stream().filter(p -> p.trackingId.equalsIgnoreCase(trackingId)).count();
+        }
         long inprogressCount = jobsInProgress.values().stream().filter(p -> p.trackingId.equalsIgnoreCase(trackingId)).count();
         TrackingResult result = new TrackingResult(pendingCount, inprogressCount);
         //System.out.println("Completed Tracking: "+ completedJobs);
         result.setCompleted(
-                completedJobs.stream()
-                        .filter(c -> c.job.trackingId.equalsIgnoreCase(trackingId))
-                        .map(p -> new TaskTrackingInfo(p.errPath, (p.stdPath)))
-                        .collect(Collectors.toList()));
+            completedJobs.stream()
+                .filter(c -> c.job.trackingId.equalsIgnoreCase(trackingId))
+                .map(p -> new TaskTrackingInfo(p.errPath, (p.stdPath)))
+                .collect(Collectors.toList()));
         //System.out.println("Failed Tracking: "+ failedJobs);
         result.setFailed(failedJobs.stream().filter(c -> c.job.trackingId.equalsIgnoreCase(trackingId))
-                .map(p -> new TaskTrackingInfo(p.errPath, p.stdPath))
-                .collect(Collectors.toList()));
+                             .map(p -> new TaskTrackingInfo(p.errPath, p.stdPath))
+                             .collect(Collectors.toList()));
         return result;
     }
 
     public List<Worker.Result> getCompletedResults(String trackingId) {
         return completedJobs.stream()
-                .filter(c -> c.job.trackingId.equalsIgnoreCase(trackingId))
-                .collect(Collectors.toList());
+            .filter(c -> c.job.trackingId.equalsIgnoreCase(trackingId))
+            .collect(Collectors.toList());
     }
 
     public interface JobStatusString {
